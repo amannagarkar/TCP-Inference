@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//usr/include/netinet/**)",
+      "Read(//usr/include/aarch64-linux-gnu/bits/**)",
+      "Bash(make:*)",
+      "Bash(sudo timeout:*)",
+      "Bash(echo \"Exit: $?\")",
+      "Bash(ls /capture)",
+      "Read(//tmp/edge_test/**)"
+    ]
+  }
+}

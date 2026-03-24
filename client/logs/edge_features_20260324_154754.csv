@@ -1,0 +1,1 @@
+ts,src_ip,dst_ip,sport,dport,direction,ip_len,payload_bytes,frame_len,dscp,ttl,tcp_flags,seq,ack,tcp_window,is_syn,is_ack,is_fin,is_rst,is_retrans,inter_pkt_gap_us,passive_rtt_us,cwnd,snd_wnd,rcv_wnd,unacked,lost,sacked,retrans,rtt_us,rttvar_us,snd_ssthresh,tcp_state,ca_state

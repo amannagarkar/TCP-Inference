@@ -1,0 +1,4 @@
+ts,src_ip,dst_ip,sport,dport,direction,ip_len,payload_bytes,frame_len,dscp,ttl,tcp_flags,seq,ack,tcp_window,is_syn,is_ack,is_fin,is_rst,is_retrans,inter_pkt_gap_us,passive_rtt_us,cwnd,snd_wnd,rcv_wnd,unacked,lost,sacked,retrans,rtt_us,rttvar_us,snd_ssthresh,tcp_state,ca_state
+1774367332.269262,192.168.2.117,185.125.190.97,49132,80,0,60,0,74,0,64,2,3897352322,0,64240,1,0,0,0,0,0.00,-1.00,0,0,0,0,0,0,0,0,0,0,UNKNOWN,0
+1774367333.273480,192.168.2.117,185.125.190.97,49132,80,0,60,0,74,0,64,2,3897352322,0,64240,1,0,0,0,0,1004217.39,-1.00,10,0,0,1,0,0,0,0,250000,2147483647,SYN_SENT,0
+1774367335.293676,192.168.2.117,185.125.190.97,49132,80,0,60,0,74,0,64,2,3897352322,0,64240,1,0,0,0,0,2020195.96,-1.00,1,0,0,1,1,0,1,0,250000,7,SYN_SENT,4

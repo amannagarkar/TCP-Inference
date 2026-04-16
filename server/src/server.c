@@ -1,13 +1,13 @@
 /*
  * server.c — TCP server for WiFi power-save RTT experiment
  *
- * Protocol: every message is a 4-byte big-endian length prefix followed
- * by the payload.  The server waits <processing_delay> ms then sends a
- * fixed 2-byte "OK" response (also length-prefixed).
- * A payload length of 0 signals end-of-session from the client.
+ * Protocol: client sends NUM_SEGMENTS segments, each as:
+ *   [seq_num (4B BE)] [payload_size (4B BE)] [payload]
+ * Server receives all segments in order, then replies:
+ *   [4B len prefix]["OK"][4B last_seq BE]
  *
  * Build:  gcc -O2 -pthread -o server server.c
- * Run:    ./server --port 5001 --delay 10 --log results/server.csv
+ * Run:    ./server --port 5001 --log results/server.csv
  */
 
 #define _GNU_SOURCE
@@ -26,16 +26,14 @@
 #include <getopt.h>
 #include <sys/stat.h>
 
-/* ── constants ───────────────────────────────────────────────────────────── */
-#define MAX_PAYLOAD     (1 << 20)   /* 1 MiB max message */
-#define RESPONSE_BODY   "OK"
-#define RESPONSE_LEN    2
+/* ── segment protocol ────────────────────────────────────────────────────── */
+#define NUM_SEGMENTS    1000        /* expected number of segments per transfer */
+#define MAX_SEG_SIZE    (1 << 16)  /* max payload per segment (64 KiB) */
 
 /* ── globals shared across threads ─────────────────────────────────────── */
-static FILE            *g_log_fp   = NULL;
-static pthread_mutex_t  g_log_mtx  = PTHREAD_MUTEX_INITIALIZER;
-static volatile int     g_running  = 1;
-static double           g_delay_ms = 10.0;   /* processing delay */
+static FILE            *g_log_fp  = NULL;
+static pthread_mutex_t  g_log_mtx = PTHREAD_MUTEX_INITIALIZER;
+static volatile int     g_running = 1;
 
 /* ── helpers ─────────────────────────────────────────────────────────────── */
 static double wall_s(void)
@@ -45,7 +43,6 @@ static double wall_s(void)
     return ts.tv_sec + ts.tv_nsec * 1e-9;
 }
 
-/* recv exactly n bytes; returns 0 on success, -1 on error/EOF */
 static int recv_exact(int fd, void *buf, size_t n)
 {
     size_t done = 0;
@@ -57,75 +54,100 @@ static int recv_exact(int fd, void *buf, size_t n)
     return 0;
 }
 
-static void ms_sleep(double ms)
+/* send OK response: [4B len prefix]["OK"][4B last_seq BE] (10 bytes total) */
+static int send_ok(int fd, uint32_t last_seq)
 {
-    struct timespec ts;
-    ts.tv_sec  = (time_t)(ms / 1000.0);
-    ts.tv_nsec = (long)((ms - ts.tv_sec * 1000.0) * 1e6);
-    nanosleep(&ts, NULL);
+    uint8_t resp[10];
+    uint32_t payload_len = htonl(6);   /* "OK" (2) + seq (4) */
+    uint32_t net_seq     = htonl(last_seq);
+    memcpy(resp,     &payload_len, 4);
+    resp[4] = 'O';
+    resp[5] = 'K';
+    memcpy(resp + 6, &net_seq, 4);
+    ssize_t sent = send(fd, resp, sizeof(resp), MSG_NOSIGNAL);
+    return (sent == (ssize_t)sizeof(resp)) ? 0 : -1;
 }
 
 /* ── per-client thread ───────────────────────────────────────────────────── */
 typedef struct {
-    int    fd;
-    char   addr[INET_ADDRSTRLEN];
-    int    port;
+    int  fd;
+    char addr[INET_ADDRSTRLEN];
+    int  port;
 } client_arg_t;
 
 static void *client_thread(void *arg)
 {
     client_arg_t *ca = (client_arg_t *)arg;
-    int fd = ca->fd;
+    int  fd = ca->fd;
     char addr[INET_ADDRSTRLEN];
     strcpy(addr, ca->addr);
     free(ca);
 
-    uint8_t *payload_buf = malloc(MAX_PAYLOAD);
+    uint8_t *payload_buf = malloc(MAX_SEG_SIZE);
     if (!payload_buf) { close(fd); return NULL; }
 
-    int msg_idx = 0;
+    double   t_start   = wall_s();
+    uint32_t last_seq  = 0;
+    int      seg_count = 0;
+    int      error     = 0;
 
-    for (;;) {
-        /* ── read 4-byte length header ── */
-        uint32_t net_len;
-        if (recv_exact(fd, &net_len, 4) < 0) break;
-        uint32_t plen = ntohl(net_len);
-        if (plen == 0) break;                  /* client signals done */
-        if (plen > MAX_PAYLOAD) { fprintf(stderr, "[server] oversized payload %u\n", plen); break; }
+    printf("[server] %s — expecting %d segments\n", addr, NUM_SEGMENTS);
 
-        /* ── read payload ── */
-        double t_recv = wall_s();
-        if (recv_exact(fd, payload_buf, plen) < 0) break;
-        double t_payload_done = wall_s();
+    /* ── receive all segments ── */
+    for (int i = 0; i < NUM_SEGMENTS; i++) {
+        uint32_t net_seq, net_size;
 
-        /* ── processing delay ── */
-        ms_sleep(g_delay_ms);
-
-        /* ── send response ── */
-        double t_resp_start = wall_s();
-        uint32_t rnet = htonl(RESPONSE_LEN);
-        uint8_t resp[4 + RESPONSE_LEN];
-        memcpy(resp, &rnet, 4);
-        memcpy(resp + 4, RESPONSE_BODY, RESPONSE_LEN);
-        if (send(fd, resp, sizeof(resp), MSG_NOSIGNAL) < 0) break;
-        double t_resp_sent = wall_s();
-
-        /* ── log ── */
-        pthread_mutex_lock(&g_log_mtx);
-        if (g_log_fp) {
-            fprintf(g_log_fp,
-                "%s,%d,%.9f,%.9f,%.9f,%.9f,%.3f\n",
-                addr, plen,
-                t_recv, t_payload_done, t_resp_start, t_resp_sent,
-                g_delay_ms);
-            fflush(g_log_fp);
+        if (recv_exact(fd, &net_seq,  4) < 0 ||
+            recv_exact(fd, &net_size, 4) < 0) {
+            fprintf(stderr, "[server] header recv failed at segment %d\n", i + 1);
+            error = 1;
+            break;
         }
-        pthread_mutex_unlock(&g_log_mtx);
 
-        msg_idx++;
+        uint32_t seq  = ntohl(net_seq);
+        uint32_t size = ntohl(net_size);
+
+        if (size > MAX_SEG_SIZE) {
+            fprintf(stderr, "[server] oversized segment %u: %u bytes\n", seq, size);
+            error = 1;
+            break;
+        }
+
+        if (recv_exact(fd, payload_buf, size) < 0) {
+            fprintf(stderr, "[server] payload recv failed at segment %u\n", seq);
+            error = 1;
+            break;
+        }
+
+        last_seq = seq;
+        seg_count++;
+
+        if (seq % 100 == 0)
+            printf("[server] received segment %u/%d (%u bytes)\n", seq, NUM_SEGMENTS, size);
     }
 
-    printf("[server] %s disconnected after %d messages\n", addr, msg_idx);
+    double t_end = wall_s();
+
+    if (!error) {
+        /* ── send OK + last_seq ── */
+        if (send_ok(fd, last_seq) < 0)
+            fprintf(stderr, "[server] failed to send OK to %s\n", addr);
+        else
+            printf("[server] sent OK last_seq=%u to %s  (%.3f ms)\n",
+                   last_seq, addr, (t_end - t_start) * 1e3);
+    }
+
+    /* ── log ── */
+    pthread_mutex_lock(&g_log_mtx);
+    if (g_log_fp) {
+        fprintf(g_log_fp, "%s,%d,%u,%.9f,%.9f,%d\n",
+                addr, seg_count, last_seq, t_start, t_end, error);
+        fflush(g_log_fp);
+    }
+    pthread_mutex_unlock(&g_log_mtx);
+
+    printf("[server] %s disconnected — %d/%d segments received\n",
+           addr, seg_count, NUM_SEGMENTS);
     free(payload_buf);
     close(fd);
     return NULL;
@@ -139,36 +161,34 @@ static void usage(const char *prog)
 {
     fprintf(stderr,
         "Usage: %s [options]\n"
-        "  -p, --port    <port>   listen port          (default: 5001)\n"
-        "  -d, --delay   <ms>     processing delay ms  (default: 10)\n"
-        "  -l, --log     <file>   CSV log file         (default: results/server.csv)\n"
-        "  -h, --help\n", prog);
+        "  -p, --port  <port>  listen port  (default: 5001)\n"
+        "  -l, --log   <file>  CSV log file (default: results/server.csv)\n"
+        "  -h, --help\n"
+        "\nExpects %d segments of [seq, size, payload] per client connection.\n",
+        prog, NUM_SEGMENTS);
     exit(1);
 }
 
 int main(int argc, char **argv)
 {
-    int port = 5001;
+    int         port     = 5001;
     const char *log_path = "results/server.csv";
 
     static struct option long_opts[] = {
-        {"port",  required_argument, 0, 'p'},
-        {"delay", required_argument, 0, 'd'},
-        {"log",   required_argument, 0, 'l'},
-        {"help",  no_argument,       0, 'h'},
+        {"port", required_argument, 0, 'p'},
+        {"log",  required_argument, 0, 'l'},
+        {"help", no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
     int c, idx;
-    while ((c = getopt_long(argc, argv, "p:d:l:h", long_opts, &idx)) != -1) {
+    while ((c = getopt_long(argc, argv, "p:l:h", long_opts, &idx)) != -1) {
         switch (c) {
-        case 'p': port       = atoi(optarg); break;
-        case 'd': g_delay_ms = atof(optarg); break;
-        case 'l': log_path   = optarg;       break;
+        case 'p': port     = atoi(optarg); break;
+        case 'l': log_path = optarg;       break;
         default:  usage(argv[0]);
         }
     }
 
-    /* create results dir if needed */
     {
         char dir[512];
         snprintf(dir, sizeof(dir), "%s", log_path);
@@ -178,9 +198,7 @@ int main(int argc, char **argv)
 
     g_log_fp = fopen(log_path, "w");
     if (!g_log_fp) { perror("fopen log"); exit(1); }
-    fprintf(g_log_fp,
-        "client_addr,payload_bytes,t_recv,t_payload_done,"
-        "t_resp_start,t_resp_sent,processing_delay_ms\n");
+    fprintf(g_log_fp, "client_addr,segments_received,last_seq,t_start,t_end,error\n");
     fflush(g_log_fp);
 
     signal(SIGINT,  sig_handler);
@@ -199,8 +217,8 @@ int main(int argc, char **argv)
     if (bind(srv, (struct sockaddr *)&saddr, sizeof(saddr)) < 0) { perror("bind"); exit(1); }
     if (listen(srv, 16) < 0) { perror("listen"); exit(1); }
 
-    printf("[server] listening on :%d  delay=%.1f ms  log=%s\n",
-           port, g_delay_ms, log_path);
+    printf("[server] listening on :%d  expecting %d segments/transfer  log=%s\n",
+           port, NUM_SEGMENTS, log_path);
 
     while (g_running) {
         struct sockaddr_in caddr;

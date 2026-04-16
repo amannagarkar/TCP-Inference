@@ -1,14 +1,14 @@
 /*
  * client.c — TCP client for WiFi power-save RTT experiment
  *
- * Sends length-prefixed messages to the server, records per-message RTT,
- * and optionally toggles 802.11 power-save on the WiFi interface via `iw`.
+ * Splits a packet into NUM_SEGMENTS segments and sends each as:
+ *   [seq_num (4B BE)] [payload_size (4B BE)] [payload]
+ * Then waits for server to reply with "OK" + last sequence number.
  *
  * Build:  gcc -O2 -o client client.c -lm
  * Run:
  *   ./client --server 192.168.1.100 --port 5001 \
- *            --msg-sizes 64,256,1024,4096 --num-messages 300 \
- *            --processing-delay 10 --power-save on --iface wlP1p1s0 \
+ *            --seg-size 64 --power-save on --iface wlP1p1s0 \
  *            --output results/csv/run_ps_on.csv --run-id pd10_ps_on_gap0
  *		[Might need sudo privileges to manage ps mode]
  */
@@ -29,11 +29,9 @@
 #include <getopt.h>
 #include <sys/stat.h>
 
-/* ── limits ──────────────────────────────────────────────────────────────── */
-#define MAX_SIZES        32
-#define MAX_MESSAGES     100000
-#define MAX_PAYLOAD      (1 << 20)
-#define RESPONSE_LEN     2
+/* ── segment protocol ────────────────────────────────────────────────────── */
+#define NUM_SEGMENTS  1000          /* total segments to send per transfer */
+#define MAX_SEG_SIZE  (1 << 16)    /* max payload per segment (64 KiB) */
 
 /* ── timing ──────────────────────────────────────────────────────────────── */
 static double mono_ms(void)
@@ -71,27 +69,36 @@ static int recv_exact(int fd, void *buf, size_t n)
     return 0;
 }
 
-static int send_message(int fd, const uint8_t *payload, uint32_t plen)
+/* send one segment: [seq(4B BE)][size(4B BE)][payload] */
+static int send_segment(int fd, uint32_t seq, const uint8_t *payload, uint32_t size)
 {
-    /* 4-byte big-endian length + payload in one writev-style send */
-    uint32_t net_len = htonl(plen);
-    uint8_t *buf = malloc(4 + plen);
-    if (!buf) return -1;
-    memcpy(buf, &net_len, 4);
-    memcpy(buf + 4, payload, plen);
-    ssize_t sent = send(fd, buf, 4 + plen, MSG_NOSIGNAL);
-    free(buf);
-    return (sent == (ssize_t)(4 + plen)) ? 0 : -1;
+    uint8_t hdr[8];
+    uint32_t net_seq  = htonl(seq);
+    uint32_t net_size = htonl(size);
+    memcpy(hdr,     &net_seq,  4);
+    memcpy(hdr + 4, &net_size, 4);
+    if (send(fd, hdr, 8, MSG_NOSIGNAL) != 8) return -1;
+    ssize_t sent = send(fd, payload, size, MSG_NOSIGNAL);
+    return (sent == (ssize_t)size) ? 0 : -1;
 }
 
-static int recv_response(int fd)
+/* recv server OK response: [4B len prefix]["OK"][4B last_seq BE]
+   response payload is 6 bytes: 'O','K' + uint32 last_seq              */
+static int recv_ok_response(int fd, uint32_t *out_last_seq)
 {
     uint32_t net_len;
     if (recv_exact(fd, &net_len, 4) < 0) return -1;
     uint32_t rlen = ntohl(net_len);
-    if (rlen > 65536) return -1;
-    uint8_t tmp[65536];
-    return recv_exact(fd, tmp, rlen);
+    if (rlen != 6) { fprintf(stderr, "[client] unexpected response len %u\n", rlen); return -1; }
+    uint8_t buf[6];
+    if (recv_exact(fd, buf, 6) < 0) return -1;
+    if (buf[0] != 'O' || buf[1] != 'K') {
+        fprintf(stderr, "[client] expected OK, got %c%c\n", buf[0], buf[1]); return -1;
+    }
+    uint32_t net_seq;
+    memcpy(&net_seq, buf + 2, 4);
+    *out_last_seq = ntohl(net_seq);
+    return 0;
 }
 
 /* ── power-save control ──────────────────────────────────────────────────── */
@@ -101,7 +108,6 @@ static int set_power_save(const char *iface, int enable)
     pid_t pid = fork();
     if (pid < 0) { perror("fork"); return 0; }
     if (pid == 0) {
-        /* child: exec iw */
         execlp("iw", "iw", "dev", iface, "set", "power_save", state, (char *)NULL);
         _exit(127);
     }
@@ -116,21 +122,7 @@ static int set_power_save(const char *iface, int enable)
     return ok;
 }
 
-/* ── parse comma-separated integers ─────────────────────────────────────── */
-static int parse_sizes(const char *str, int *out, int max_out)
-{
-    int count = 0;
-    char *buf = strdup(str);
-    char *tok = strtok(buf, ",");
-    while (tok && count < max_out) {
-        out[count++] = atoi(tok);
-        tok = strtok(NULL, ",");
-    }
-    free(buf);
-    return count;
-}
-
-/* ── simple xorshift random (no stdlib rand dependency) ──────────────────── */
+/* ── simple xorshift random ───────────────────────────────────────────────── */
 static uint32_t xstate = 0xdeadbeef;
 static uint8_t xrand8(void) {
     xstate ^= xstate << 13;
@@ -139,103 +131,63 @@ static uint8_t xrand8(void) {
     return (uint8_t)(xstate & 0xff);
 }
 
-/* ── result record ───────────────────────────────────────────────────────── */
-typedef struct {
-    int      msg_index;
-    int      msg_size;
-    double   rtt_ms;
-    double   t_send;
-    double   t_recv;
-} record_t;
-
 /* ── usage ───────────────────────────────────────────────────────────────── */
 static void usage(const char *prog)
 {
     fprintf(stderr,
         "Usage: %s [options]\n"
-        "  -s, --server            <ip>     server IP (required)\n"
-        "  -P, --port              <port>   server port          (default: 5001)\n"
-        "  -S, --msg-sizes         <s,s,..> comma-separated payload sizes in bytes\n"
-        "                                   (default: 64,256,1024,4096)\n"
-        "  -n, --num-messages      <n>      messages per run     (default: 300)\n"
-        "  -g, --inter-gap-ms      <ms>     gap between messages (default: 0)\n"
-        "  -D, --processing-delay  <ms>     expected server delay, logged only\n"
-        "  -p, --power-save        on|off   WiFi power save mode (default: off)\n"
-        "  -i, --iface             <iface>  WiFi interface       (default: wlP1p1s0)\n"
-        "  -o, --output            <file>   output CSV           (default: results/client_run.csv)\n"
-        "  -r, --run-id            <id>     label for this run\n"
-        "  -h, --help\n", prog);
+        "  -s, --server       <ip>    server IP (required)\n"
+        "  -P, --port         <port>  server port         (default: 5001)\n"
+        "  -z, --seg-size     <bytes> payload per segment (default: 64)\n"
+        "  -p, --power-save   on|off  WiFi power save     (default: off)\n"
+        "  -i, --iface        <iface> WiFi interface      (default: wlP1p1s0)\n"
+        "  -o, --output       <file>  output CSV          (default: results/client_run.csv)\n"
+        "  -r, --run-id       <id>    label for this run\n"
+        "  -h, --help\n"
+        "\nSends %d segments of [seq, size, payload] then awaits OK + last_seq.\n",
+        prog, NUM_SEGMENTS);
     exit(1);
 }
 
 /* ── main ────────────────────────────────────────────────────────────────── */
 int main(int argc, char **argv)
 {
-    /* defaults */
-    const char *server_ip       = NULL;
-    int         port            = 8000;
-    const char *sizes_str       = "64,256,1024,4096";
-    int         num_messages    = 300;
-    double      inter_gap_ms    = 0.0;
-    double      proc_delay_ms   = 10.0;
-    int         power_save      = 0;
-    const char *iface           = "wlP1p1s0";
-    const char *output_path     = "results/client_run.csv";
-    const char *run_id          = "";
+    const char *server_ip  = NULL;
+    int         port       = 5001;
+    int         seg_size   = 64;
+    int         power_save = 0;
+    const char *iface      = "wlP1p1s0";
+    const char *output_path = "results/client_run.csv";
+    const char *run_id     = "";
 
     static struct option long_opts[] = {
-        {"server",           required_argument, 0, 's'},
-        {"port",             required_argument, 0, 'P'},
-        {"msg-sizes",        required_argument, 0, 'S'},
-        {"num-messages",     required_argument, 0, 'n'},
-        {"inter-gap-ms",     required_argument, 0, 'g'},
-        {"processing-delay", required_argument, 0, 'D'},
-        {"power-save",       required_argument, 0, 'p'},
-        {"iface",            required_argument, 0, 'i'},
-        {"output",           required_argument, 0, 'o'},
-        {"run-id",           required_argument, 0, 'r'},
-        {"help",             no_argument,       0, 'h'},
+        {"server",     required_argument, 0, 's'},
+        {"port",       required_argument, 0, 'P'},
+        {"seg-size",   required_argument, 0, 'z'},
+        {"power-save", required_argument, 0, 'p'},
+        {"iface",      required_argument, 0, 'i'},
+        {"output",     required_argument, 0, 'o'},
+        {"run-id",     required_argument, 0, 'r'},
+        {"help",       no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
 
     int c, idx;
-    while ((c = getopt_long(argc, argv, "s:P:S:n:g:D:p:i:o:r:h", long_opts, &idx)) != -1) {
+    while ((c = getopt_long(argc, argv, "s:P:z:p:i:o:r:h", long_opts, &idx)) != -1) {
         switch (c) {
-        case 's': server_ip     = optarg;                    break;
-        case 'P': port          = atoi(optarg);              break;
-        case 'S': sizes_str     = optarg;                    break;
-        case 'n': num_messages  = atoi(optarg);              break;
-        case 'g': inter_gap_ms  = atof(optarg);              break;
-        case 'D': proc_delay_ms = atof(optarg);              break;
-        case 'p': power_save    = (strcmp(optarg,"on")==0);  break;
-        case 'i': iface         = optarg;                    break;
-        case 'o': output_path   = optarg;                    break;
-        case 'r': run_id        = optarg;                    break;
+        case 's': server_ip  = optarg;                   break;
+        case 'P': port       = atoi(optarg);             break;
+        case 'z': seg_size   = atoi(optarg);             break;
+        case 'p': power_save = (strcmp(optarg,"on")==0); break;
+        case 'i': iface      = optarg;                   break;
+        case 'o': output_path = optarg;                  break;
+        case 'r': run_id     = optarg;                   break;
         default:  usage(argv[0]);
         }
     }
     if (!server_ip) { fprintf(stderr, "ERROR: --server required\n"); usage(argv[0]); }
-    if (num_messages > MAX_MESSAGES) num_messages = MAX_MESSAGES;
-
-    /* parse sizes */
-    int sizes[MAX_SIZES];
-    int n_sizes = parse_sizes(sizes_str, sizes, MAX_SIZES);
-    if (n_sizes == 0) { fprintf(stderr, "ERROR: no valid --msg-sizes\n"); exit(1); }
-
-    /* build size sequence: round-robin, then shuffle (Fisher-Yates) */
-    int seq[MAX_MESSAGES];
-    int per = num_messages / n_sizes;
-    int fill = 0;
-    for (int i = 0; i < n_sizes && fill < num_messages; i++)
-        for (int j = 0; j < per && fill < num_messages; j++)
-            seq[fill++] = sizes[i];
-    /* fill remainder */
-    for (int i = 0; fill < num_messages; i = (i+1) % n_sizes)
-        seq[fill++] = sizes[i];
-    /* Fisher-Yates shuffle */
-    for (int i = num_messages - 1; i > 0; i--) {
-        int j = (int)((uint32_t)xrand8() * (i + 1) / 256);
-        int tmp = seq[i]; seq[i] = seq[j]; seq[j] = tmp;
+    if (seg_size < 1 || seg_size > MAX_SEG_SIZE) {
+        fprintf(stderr, "ERROR: --seg-size must be 1..%d\n", MAX_SEG_SIZE); exit(1);
     }
 
     /* make results dir */
@@ -246,9 +198,8 @@ int main(int argc, char **argv)
         if (slash) { *slash = '\0'; mkdir(dir, 0755); }
     }
 
-    /* set power save BEFORE connecting */
     int ps_ok = set_power_save(iface, power_save);
-    ms_sleep(500); /* let driver apply PS state */
+    ms_sleep(500);
 
     /* connect */
     int fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -265,84 +216,60 @@ int main(int argc, char **argv)
     }
     int flag = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
-    printf("[client] connected — sending %d messages (PS=%s)\n",
-           num_messages, power_save ? "on" : "off");
+    printf("[client] connected — sending %d segments of %d bytes each (PS=%s)\n",
+           NUM_SEGMENTS, seg_size, power_save ? "on" : "off");
 
-    /* allocate result buffer and payload scratch */
-    record_t *results = calloc(num_messages, sizeof(record_t));
-    uint8_t  *payload = malloc(MAX_PAYLOAD);
-    if (!results || !payload) { fprintf(stderr, "OOM\n"); exit(1); }
-    /* fill payload with random bytes once */
-    for (int i = 0; i < MAX_PAYLOAD; i++) payload[i] = xrand8();
+    /* fill segment payload with random bytes */
+    uint8_t *payload = malloc((size_t)seg_size);
+    if (!payload) { fprintf(stderr, "OOM\n"); exit(1); }
+    for (int i = 0; i < seg_size; i++) payload[i] = xrand8();
 
-    /* ── message loop ── */
-    int actual = 0;
-    for (int i = 0; i < num_messages; i++) {
-        int sz = seq[i];
+    /* ── send all segments ── */
+    double t0    = mono_ms();
+    double wall0 = wall_s();
+    int failed   = 0;
 
-        double t0 = mono_ms();
-        double wall0 = wall_s();
-        if (send_message(fd, payload, (uint32_t)sz) < 0) {
-            fprintf(stderr, "[client] send failed at msg %d\n", i); break;
+    for (uint32_t seq = 1; seq <= (uint32_t)NUM_SEGMENTS; seq++) {
+        if (send_segment(fd, seq, payload, (uint32_t)seg_size) < 0) {
+            fprintf(stderr, "[client] send failed at segment %u\n", seq);
+            failed = 1;
+            break;
         }
-        if (recv_response(fd) < 0) {
-            fprintf(stderr, "[client] recv failed at msg %d\n", i); break;
-        }
-        double t1 = mono_ms();
-
-        results[actual].msg_index = i;
-        results[actual].msg_size  = sz;
-        results[actual].rtt_ms    = t1 - t0;
-        results[actual].t_send    = wall0;
-        results[actual].t_recv    = wall0 + (t1 - t0) / 1000.0;
-        actual++;
-
-        if ((i + 1) % 50 == 0)
-            printf("[client]  %d/%d  last RTT=%.2f ms\n", i+1, num_messages,
-                   results[actual-1].rtt_ms);
-
-        if (inter_gap_ms > 0.0) ms_sleep(inter_gap_ms);
+        if (seq % 100 == 0)
+            printf("[client] sent %u/%d segments\n", seq, NUM_SEGMENTS);
     }
 
-    /* signal end-of-session */
-    uint32_t zero = 0;
-    send(fd, &zero, 4, MSG_NOSIGNAL);
+    double rtt_ms   = 0.0;
+    double wall_recv = wall0;
+    uint32_t last_seq = 0;
+
+    if (!failed) {
+        /* ── await OK response ── */
+        if (recv_ok_response(fd, &last_seq) < 0) {
+            fprintf(stderr, "[client] failed to receive OK response\n");
+            failed = 1;
+        } else {
+            double t1 = mono_ms();
+            wall_recv = wall0 + (t1 - t0) / 1000.0;
+            rtt_ms    = t1 - t0;
+            printf("[client] received OK — last_seq=%u  RTT=%.2f ms\n", last_seq, rtt_ms);
+        }
+    }
+
     close(fd);
 
     /* ── write CSV ── */
     FILE *fp = fopen(output_path, "w");
     if (!fp) { perror("fopen output"); exit(1); }
-    fprintf(fp, "run_id,msg_index,msg_size_bytes,rtt_ms,t_send,t_recv,"
-                "power_save,ps_set_ok,processing_delay_ms,iface,inter_gap_ms\n");
-    for (int i = 0; i < actual; i++) {
-        fprintf(fp, "%s,%d,%d,%.4f,%.9f,%.9f,%d,%d,%.3f,%s,%.3f\n",
-            run_id,
-            results[i].msg_index,
-            results[i].msg_size,
-            results[i].rtt_ms,
-            results[i].t_send,
-            results[i].t_recv,
-            power_save,
-            ps_ok,
-            proc_delay_ms,
-            iface,
-            inter_gap_ms);
-    }
+    fprintf(fp, "run_id,num_segments,seg_size_bytes,last_seq_acked,"
+                "rtt_ms,t_send,t_recv,power_save,ps_set_ok,iface\n");
+    fprintf(fp, "%s,%d,%d,%u,%.4f,%.9f,%.9f,%d,%d,%s\n",
+        run_id, NUM_SEGMENTS, seg_size, last_seq,
+        rtt_ms, wall0, wall_recv,
+        power_save, ps_ok, iface);
     fclose(fp);
 
-    /* ── summary stats ── */
-    double sum = 0, mn = 1e9, mx = 0;
-    for (int i = 0; i < actual; i++) {
-        double r = results[i].rtt_ms;
-        sum += r;
-        if (r < mn) mn = r;
-        if (r > mx) mx = r;
-    }
-    printf("[client] done  msgs=%d  RTT min=%.2f avg=%.2f max=%.2f ms\n",
-           actual, mn, sum/actual, mx);
     printf("[client] results -> %s\n", output_path);
-
-    free(results);
     free(payload);
-    return 0;
+    return failed ? 1 : 0;
 }

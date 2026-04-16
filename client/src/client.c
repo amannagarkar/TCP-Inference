@@ -8,8 +8,9 @@
  * Run:
  *   ./client --server 192.168.1.100 --port 5001 \
  *            --msg-sizes 64,256,1024,4096 --num-messages 300 \
- *            --processing-delay 10 --power-save on --iface wlan0 \
+ *            --processing-delay 10 --power-save on --iface wlP1p1s0 \
  *            --output results/csv/run_ps_on.csv --run-id pd10_ps_on_gap0
+ *		[Might need sudo privileges to manage ps mode]
  */
 
 #define _GNU_SOURCE
@@ -160,7 +161,7 @@ static void usage(const char *prog)
         "  -g, --inter-gap-ms      <ms>     gap between messages (default: 0)\n"
         "  -D, --processing-delay  <ms>     expected server delay, logged only\n"
         "  -p, --power-save        on|off   WiFi power save mode (default: off)\n"
-        "  -i, --iface             <iface>  WiFi interface       (default: wlan0)\n"
+        "  -i, --iface             <iface>  WiFi interface       (default: wlP1p1s0)\n"
         "  -o, --output            <file>   output CSV           (default: results/client_run.csv)\n"
         "  -r, --run-id            <id>     label for this run\n"
         "  -h, --help\n", prog);
@@ -172,13 +173,13 @@ int main(int argc, char **argv)
 {
     /* defaults */
     const char *server_ip       = NULL;
-    int         port            = 5001;
+    int         port            = 8000;
     const char *sizes_str       = "64,256,1024,4096";
     int         num_messages    = 300;
     double      inter_gap_ms    = 0.0;
     double      proc_delay_ms   = 10.0;
     int         power_save      = 0;
-    const char *iface           = "wlan0";
+    const char *iface           = "wlP1p1s0";
     const char *output_path     = "results/client_run.csv";
     const char *run_id          = "";
 
